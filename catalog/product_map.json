@@ -1,0 +1,26 @@
+{
+  "_comment": "商品 → 资料链接映射。查询优先级：by_sku_id > by_goods_id > by_keyword(最长命中)。",
+  "by_sku_id": {
+    "1876675563671": {
+      "title": "【系统教学】散打基础教程视频版",
+      "url": "https://pan.baidu.com/s/1Guz-8Lzmw-guvg3gByc7SQ",
+      "pwd": "fdby",
+      "extra_text": ""
+    }
+  },
+  "by_goods_id": {},
+  "by_keyword": [
+    {
+      "match": ["散打", "S022"],
+      "title": "散打教程",
+      "url": "https://pan.baidu.com/s/1Guz-8Lzmw-guvg3gByc7SQ",
+      "pwd": "fdby"
+    },
+    {
+      "match": ["单片机", "S010", "STM32"],
+      "title": "STM32 单片机嵌入式视频教程",
+      "url": "https://pan.baidu.com/s/15DjhGlaxSJvNCdZiXDjtZA",
+      "pwd": "3ua3"
+    }
+  ]
+}
