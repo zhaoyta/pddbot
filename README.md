@@ -69,7 +69,9 @@ Python 3.11 · Playwright · PySide6 · LangGraph / LangChain · SQLite · DeepS
 
 ## 安全与隐私
 
-- **`storage_state.json`**（浏览器登录态）与 **`.env`** 含敏感信息，请勿提交到版本库（应在 `.gitignore` 中）。
+- **项目性质**：本仓库为独立开源作品，**与拼多多及其关联方无授权、赞助或合作关系**；文档中出现的「拼多多」等名称仅用于说明所面向的网页环境。
+- **勿随仓库或发行包泄露本地数据**：除 **`storage_state.json`**、**`.env`** 外，**`db/*.db`**（含会话与业务数据）、**`logs/`**、**`captures/`** 亦可能含店铺与买家相关信息；请勿提交到 Git，制作源码压缩包或 Release 前请确认未误夹带上述路径。
+- **`storage_state.json`**（浏览器登录态）与 **`.env`** 含敏感信息，请勿提交到版本库（已在 `.gitignore` 中）。
 - 数据库默认在 `db/pddbot.db`，请自行备份并限制访问权限。
 
 ---
