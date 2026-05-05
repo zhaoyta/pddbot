@@ -76,7 +76,11 @@ cp .env.example .env
 
 ## 社区与支持
 
-交流用法与更新：**[`md/community.md`](md/community.md)**（加微信群前先扫码添加好友，**备注 `PDDBOT`**；自愿打赏二维码见同页）。
+用微信扫描下方二维码 **添加好友**，申请时 **备注 `PDDBOT`**，通过后会视情况拉入交流群。更多说明与自愿打赏见 **[`md/community.md`](md/community.md)**。
+
+<p align="center">
+  <img src="./assets/@assets/gerenerweima.JPG" alt="微信扫码添加好友，备注 PDDBOT" width="240" />
+</p>
 
 ---
 
