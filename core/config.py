@@ -1,13 +1,17 @@
-"""项目级配置：URL、路径、运行参数"""
+"""项目级内置常量：URL、路径、与 .env 同步的默认值。
+
+与 ``core.settings`` 的分工:本模块只放**仓库内置**常量/路径锚点;可运行时覆盖的项在
+SQLite ``settings`` 表,由 GUI 读写,空值再回退到此处。
+"""
 from __future__ import annotations
 
 import os
-from datetime import time as dtime
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-ROOT = Path(__file__).parent
+# 本文件位于 core/,项目根为其上一级
+ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
 # ----- URL -----
@@ -22,13 +26,21 @@ STORAGE_STATE_PATH = ROOT / "storage_state.json"
 CAPTURES_DIR = ROOT / "captures"
 LOGS_DIR = ROOT / "logs"
 ASSETS_DIR = ROOT / "assets"
-CATALOG_DIR = ROOT / "catalog"
-DB_PATH = ROOT / "pddbot.db"
+# GUI 应用图标(拼多多客服 bot)
+ASSETS_APP_ICON = ASSETS_DIR / "@assets" / "icon.png"
+DB_DIR = ROOT / "db"
+DB_PATH = DB_DIR / "pddbot.db"
 
-CARD_CODE_GUIDE_IMAGE = ASSETS_DIR / "card_code_guide.png"
-PRODUCT_MAP_PATH = CATALOG_DIR / "product_map.json"
+# S2 引导「如何获取卡券码」教程图：默认使用 @assets/cardguide.JPG，若无则回退 card_code_guide.png
+_CARD_GUIDE_PRIMARY = ASSETS_DIR / "@assets" / "cardguide.JPG"
+_CARD_GUIDE_LEGACY = ASSETS_DIR / "card_code_guide.png"
+CARD_CODE_GUIDE_IMAGE = (
+    _CARD_GUIDE_PRIMARY
+    if _CARD_GUIDE_PRIMARY.is_file()
+    else _CARD_GUIDE_LEGACY
+)
 
-for d in (CAPTURES_DIR, LOGS_DIR, ASSETS_DIR, CATALOG_DIR):
+for d in (CAPTURES_DIR, LOGS_DIR, ASSETS_DIR, ASSETS_DIR / "@assets", DB_DIR):
     d.mkdir(exist_ok=True)
 
 # ----- 浏览器 -----
@@ -38,6 +50,17 @@ USER_AGENT = (
     "Chrome/129.0.0.0 Safari/537.36"
 )
 VIEWPORT = {"width": 1440, "height": 900}
+
+# ----- 总开关 -----
+def _bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+BOT_ENABLED = _bool("BOT_ENABLED", True)
+DRY_RUN = _bool("DRY_RUN", False)
 
 # ----- LLM -----
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
@@ -49,20 +72,6 @@ REPLY_DELAY_MIN = float(os.getenv("REPLY_DELAY_MIN", "1.5"))
 REPLY_DELAY_MAX = float(os.getenv("REPLY_DELAY_MAX", "3.5"))
 RATE_LIMIT_PER_UID_PER_MIN = int(os.getenv("RATE_LIMIT_PER_UID_PER_MIN", "3"))
 RATE_LIMIT_GLOBAL_PER_MIN = int(os.getenv("RATE_LIMIT_GLOBAL_PER_MIN", "30"))
-
-
-def _parse_time(s: str | None) -> dtime | None:
-    if not s:
-        return None
-    try:
-        h, m = s.split(":")
-        return dtime(int(h), int(m))
-    except Exception:
-        return None
-
-
-NIGHT_QUIET_START = _parse_time(os.getenv("NIGHT_QUIET_START", "23:00"))
-NIGHT_QUIET_END = _parse_time(os.getenv("NIGHT_QUIET_END", "08:00"))
 
 ESCALATE_WEBHOOK = os.getenv("ESCALATE_WEBHOOK", "").strip() or None
 

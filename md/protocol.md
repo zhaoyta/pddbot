@@ -61,7 +61,7 @@
 - **页面 Tab**：`订单核销`
 - **入口**：商家后台 → 发货管理 → **核销工具**
 
-**页面元素（来自截图，selector 待 explore_redeem.py 补全）**：
+**页面元素（来自截图，selector 待 `scripts/explore_redeem.py` 补全）**：
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -103,7 +103,7 @@ async def redeem(code: str) -> dict:
     return {"success": True, "code": code}
 ```
 
-**关键 selector 占位（待 `explore_redeem.py` 抓取后填入）**：
+**关键 selector 占位（待 `scripts/explore_redeem.py` 抓取后填入）**：
 
 | 含义 | 占位变量 | 数据来源 |
 |---|---|---|
@@ -114,7 +114,7 @@ async def redeem(code: str) -> dict:
 | 开始核销 按钮 | `START_REDEEM_BTN_SELECTOR` | redeem_dom_latest → "按钮"."开始核销" |
 | 核销记录表格 | `RECORD_TABLE_SELECTOR` | redeem_dom_latest → "表格候选" |
 
-> 同时 `explore_redeem.py` 会抓"开始核销"那一刻的 HTTP 请求（POST 到某 verify 接口），可作为后续直接调 API 的备选路径（暂不启用，统一走 DOM）。
+> 同时 `scripts/explore_redeem.py` 会抓"开始核销"那一刻的 HTTP 请求（POST 到某 verify 接口），可作为后续直接调 API 的备选路径（暂不启用，统一走 DOM）。
 
 ### 1.4 发送消息（决策：走 DOM 模拟，不调 API）
 
@@ -196,21 +196,18 @@ def is_pending_user_msg(m: dict) -> bool:
 
 ## 3. 监听新消息的策略（结合上面的发现）
 
-### 推荐做法（双保险）
+### 推荐做法（当前实现）
 
-1. **HTTP 拦截**：`page.on("response")` 监听 `/plateau/chat/list` 等接口
-   - 命中后解析 `result.messages`
-   - 维护 `last_seen_msg_id`（每个会话独立），只处理 `msg_id > last_seen_msg_id` 的客户消息
-2. **WebSocket 拦截**（兜底实时性）
-   - 拼多多端到端推送多走 WS，HTTP `list` 多用于会话切换 / 回放
-   - WS 协议未确认，等 `chat_*.jsonl` 抓出来分析
+1. **HTTP 拦截**：`page.on("response")` 监听 `/plateau/sync/message`、`/plateau/chat/list`、`latest_conversations`、`userAllOrder` 等
+   - 命中后解析内嵌消息或 `result.messages`
+   - 与 `conv_state.last_msg_id` 去重，只处理新的客户消息
 
 ### 几个值得验证的问题
 
 | 问题 | 验证方式 |
 |---|---|
 | 切换会话是否每次都重新拉 `chat/list` ？ | 探查脚本里多切几次会话观察 |
-| 新消息进来时是 WS 推送 还是会重新拉一次 list？ | 等真实客户消息进来时观察 |
+| 新消息主要靠哪条接口先到（`sync/message` 还是 `chat/list`）？ | 等真实客户消息进来时对照 `chat_*.jsonl` |
 | `list` 接口是否有"按 msg_id 之后"的增量参数？ | 看请求 `post_data` / query string |
 | ~~发送消息接口路径 / 请求体？~~ | 已决定走 DOM 模拟点击，不再关心 |
 

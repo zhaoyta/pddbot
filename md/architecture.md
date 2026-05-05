@@ -3,6 +3,28 @@
 > 业务场景：拼多多店铺【想要资料库】卖虚拟教程，客户付款后凭卡券码核销取资料。
 > 自动客服需要按"咨询 → 引导核销 → 执行核销 → 发资料"四阶段顺序闭环，每阶段由 LLM + 受限 tools 完成。
 
+**业务主链与代码模块的一页索引**（会话监听 / 进会话后决策回复 / 列表已处理跳过）：见 [core_flow_modules.md](./core_flow_modules.md)。
+
+---
+
+## 0. 关键决策与边界条件（已确认）
+
+> 来自 review 阶段的决策，所有实现必须遵守。
+
+| # | 场景 | 决策 |
+|---|---|---|
+| D1 | 单 uid 多笔订单未核销 | 只处理**最新一笔**（按 `orderTime` 倒序取第一） |
+| D2 | 客户说"链接失效/打不开/没收到，再发一份" | **直接转人工**，不主动重发资料 |
+| D3 | 客户有售后单（`afterSalesInfo != null` 或 `compensateInfo.status` 有值） | **立即转人工 + 该 uid 静默 30 分钟** |
+| D4 | 首次接待该 uid（`conv_state` 无记录） | 先发一句"您好，请问有什么可以帮您？"，**等下一条消息才走 stage** |
+| D5 | 风控阈值 | 保持 `.env` 默认：全店 30/分钟、单 uid 3/分钟、夜间 23:00-08:00 静默 |
+| D6 | 干跑模式 | 通过 `DRY_RUN=true` 切：LLM 正常生成回复但**不点发送**，只写 `action_log` 表，方便人工审核 |
+| D7 | 总开关 | `BOT_ENABLED=false` 时整个 bot 进入待机状态，只监听不动作（出问题秒关） |
+| D8 | 资料回复格式 | 严格按百度网盘原生分享格式（见 `tools/catalog.py` `to_message`） |
+| D9 | 资料映射主键 | `goodsId` 优先，`skuId` 次之，关键字兜底 |
+| D10 | 发送消息方式 | DOM 模拟点击发送按钮，不调发送 API |
+| D11 | 核销方式 | 在新 tab 打开 `/orders/order/verify` 页面 DOM 操作 |
+
 ---
 
 ## 1. 状态机
@@ -13,13 +35,17 @@
 
 | Stage | 名称 | 触发条件 | 核心动作 |
 |---|---|---|---|
+| **S0** | 首次打招呼 | 该 uid 在 `conv_state` 表里**无记录**（D4） | 发"您好，请问有什么可以帮您？"，记录 uid，**不进入业务处理** |
 | **S1** | 咨询 | 该 uid 无订单 | 介绍商品 / 答疑 / 引导下单 |
-| **S2** | 下单未核销引导 | 该 uid 有"已支付订单"且本订单**未发过教程图** | 发送"如何获取核销码"图片 + 文案 |
+| **S2** | 下单未核销引导 | 有"已支付订单"且**最新一笔**（D1）未发过教程图 | 发送"如何获取核销码"图片 + 文案 |
 | **S3** | 收到核销码 | 客户消息里**识别到合法核销码**且该码**未核销过** | 提取码 → 打开核销页 → 输入码 → 提交 |
-| **S4** | 核销完成发资料 | 该 uid 当前订单**已核销** | 按"订单商品名 / skuId → 资料链接" 映射回复 |
+| **S4** | 核销完成发资料 | 该 uid 有**已核销但未发资料**的订单（取最新一笔） | 按 `goodsId` 查映射，按百度网盘格式回复 |
+| **S_HUMAN** | 转人工 | 触发 D2 / D3 / 工具连续失败等 | 发"已为您转接人工客服" + 静默 30 分钟 |
 
-> 同一条新消息进入时，**按 S3 → S4 → S2 → S1 优先级判定**，确保顺序不被破坏：
-> - 先看消息内容里是不是带核销码（S3 是用户主动行为）
+> 同一条新消息进入时，**按 S_HUMAN → S0 → S3 → S4 → S2 → S1 优先级判定**：
+> - 先看是否触发"必须转人工"硬规则（售后/退款/明确求重发）
+> - 再看是不是首次接待
+> - 再看消息含核销码（客户主动行为）
 > - 再看是否处于 S4（订单已核销待发资料）
 > - 再看是否处于 S2（订单已付未引导）
 > - 都不是 → 兜底到 S1
@@ -28,32 +54,46 @@
 
 ```python
 def decide_stage(uid: str, latest_msg: dict, orders: list[dict],
-                 store: LocalStore) -> Stage:
+                 store: LocalStore) -> tuple[Stage, dict]:
+    text = (latest_msg.get("content") or "").strip()
+
+    # ---- S_HUMAN（D2/D3）：必须转人工的硬规则 ----
+    if any(kw in text for kw in ("失效", "打不开", "过期", "拿不到", "下载不了",
+                                  "投诉", "12315", "差评", "曝光")):
+        return Stage.S_HUMAN, {"reason": "客户索要重发或敏感词触发"}
+    if any(o.get("afterSalesInfo") or
+           (o.get("compensateInfo") or {}).get("status")
+           for o in orders):
+        return Stage.S_HUMAN, {"reason": "客户存在售后/退款单"}
+
+    # ---- S0（D4）：首次接待打招呼 ----
+    if store.get_last_msg_id(uid) is None:
+        return Stage.S0_GREET, {}
+
     # ---- S3：客户发了核销码 ----
-    code = extract_card_code(latest_msg["content"])
+    code = extract_card_code(text)
     if code and not store.is_code_redeemed(code):
         return Stage.S3_REDEEM, {"code": code}
 
-    # ---- S4：当前 uid 有已核销但还没发资料的订单 ----
-    pending_deliver = [
-        o for o in orders
-        if store.is_order_redeemed(o["orderSn"])
-           and not store.is_order_delivered(o["orderSn"])
-    ]
-    if pending_deliver:
-        return Stage.S4_DELIVER, {"order": pending_deliver[0]}
+    # ---- 取该 uid 最新一笔订单（D1） ----
+    orders_desc = sorted(orders, key=lambda o: o.get("orderTime") or 0,
+                         reverse=True)
+    latest_order = orders_desc[0] if orders_desc else None
 
-    # ---- S2：有已付订单但还没发过引导图 ----
-    pending_guide = [
-        o for o in orders
-        if o.get("payStatus") == 2
-           and not store.is_guide_sent(o["orderSn"])
-    ]
-    if pending_guide:
-        return Stage.S2_GUIDE, {"order": pending_guide[0]}
+    # ---- S4：最新一笔已核销但还没发资料 ----
+    if latest_order and \
+       store.is_order_redeemed(latest_order["orderSn"]) and \
+       not store.is_order_delivered(latest_order["orderSn"]):
+        return Stage.S4_DELIVER, {"order": latest_order}
+
+    # ---- S2：最新一笔已付但还没发过引导图 ----
+    if latest_order and \
+       latest_order.get("payStatus") == 2 and \
+       not store.is_guide_sent(latest_order["orderSn"]):
+        return Stage.S2_GUIDE, {"order": latest_order}
 
     # ---- 兜底 S1：咨询 ----
-    return Stage.S1_CONSULT, {}
+    return Stage.S1_CONSULT, {"order": latest_order}
 ```
 
 ---
@@ -62,16 +102,17 @@ def decide_stage(uid: str, latest_msg: dict, orders: list[dict],
 
 ```
 pddbot/
-├── login.py                  # 首次扫码登录
-├── explore.py                # 抓 selector / 接口（已完成）
-├── config.py                 # 全局常量
+├── scripts/                  # 手动探查（见 md/scripts.md）
+│   ├── explore.py            # 聊天页抓包 / DOM 探针
+│   └── explore_redeem.py     # 核销页探针
 │
 ├── runtime/                  # 浏览器运行时
-│   ├── browser.py            #   启动浏览器、加载 storage_state、注入反检测
+│   ├── browser.py            #   启动浏览器、加载 storage_state、扫码兜底、注入反检测
 │   ├── network.py            #   监听 chat/list、userAllOrder 响应，分发到 EventBus
 │   └── selectors.py          #   会话列表 / 输入框 / 发送按钮 / 核销页 selector 集中管理
 │
 ├── core/                     # 业务核心
+│   ├── config.py             #   内置常量：ROOT、默认 URL、路径、.env 兜底
 │   ├── events.py             #   EventBus + 事件类型定义（NewUserMessage / OrdersUpdated…）
 │   ├── store.py              #   本地持久化（SQLite）：会话状态、已发引导、已核销码、已发资料
 │   ├── stage.py              #   决策器：根据 uid + msg + orders + store 判 Stage
@@ -89,8 +130,7 @@ pddbot/
 │   ├── prompts.py            #   各 Stage 的系统 prompt
 │   └── agent.py              #   ReAct 风格的工具调用循环（含最大轮次限制）
 │
-├── catalog/
-│   └── product_map.json      #   商品名 / skuId / goodsId → 资料链接 + 提取码
+├── db/pddbot.db             #   所有动态数据：会话状态 / 配置 / 商品映射 / 聊天历史 / action_log
 │
 ├── assets/
 │   └── card_code_guide.png   #   "如何获取核销码"的引导图（Stage S2 发）
@@ -111,6 +151,24 @@ pddbot/
 3. 当你不确定怎么处理时，调用 escalate_to_human 转人工。
 4. 严格按工具返回的事实回复，不要编造订单号、链接、价格。
 ```
+
+### 3.1.5 Stage S0（首次打招呼）
+
+| 项 | 内容 |
+|---|---|
+| 上下文 | 仅当前消息 |
+| 可用 tools | `send_text` |
+| 目标 | 发一句"您好，请问有什么可以帮您？"。**不调用 LLM 也行**，模板即可 |
+| 副作用 | `store.set_last_msg_id(uid, msg_id)` 标记已接待过 |
+
+### 3.1.6 Stage S_HUMAN（转人工）
+
+| 项 | 内容 |
+|---|---|
+| 触发 | D2（索要重发）/ D3（售后）/ 工具连续 2 次失败 |
+| 可用 tools | `escalate_to_human` |
+| 目标 | 发"非常抱歉，已为您转接人工客服，请稍候"，并对该 uid 静默 30 分钟 |
+| 副作用 | `store.silence_uid(uid, 1800)` |
 
 ### 3.2 Stage S1（咨询）
 
@@ -187,7 +245,7 @@ def verify_redeem_result(code: str) -> dict:
 def lookup_product_url(goods_name: str | None = None,
                        sku_id: int | None = None,
                        goods_id: int | None = None) -> dict | None:
-    """从 catalog/product_map.json 查映射。优先 skuId，再 goodsId，再模糊匹配 goodsName。"""
+    """从 catalog_item 表查映射。优先 goodsId,再 skuId,再关键字命中(最长匹配)。"""
 
 # tools/notify.py
 def escalate_to_human(uid: str, reason: str) -> dict:
@@ -248,28 +306,17 @@ CREATE TABLE action_log (
 
 ## 6. 商品 → 资料 映射格式
 
-`catalog/product_map.json`：
+数据存在 `db/pddbot.db` 的 `catalog_item` 表(见 §5),由 GUI「商品」页 CRUD。
 
-```json
-{
-  "by_sku_id": {
-    "1876675563671": {
-      "title": "【系统教学】散打基础教程视频版",
-      "url": "https://pan.baidu.com/s/1Guz-8Lzmw-guvg3gByc7SQ",
-      "pwd": "fdby"
-    }
-  },
-  "by_goods_id": {
-    "928035245974": { "title": "...", "url": "...", "pwd": "..." }
-  },
-  "by_keyword": [
-    { "match": ["散打", "S022"], "url": "...", "pwd": "fdby" },
-    { "match": ["单片机", "S010"], "url": "...", "pwd": "3ua3" }
-  ]
-}
-```
+每行字段:
 
-`lookup_product_url` 查询优先级：`by_sku_id` > `by_goods_id` > `by_keyword`（模糊匹配最长命中）。
+| 字段 | 说明 |
+|---|---|
+| `match_type` | `goods_id` / `sku_id` / `keyword` |
+| `match_value` | 商品 ID / SKU ID 数字串;关键字模式时用英文逗号分隔多个词,如 `"散打,S022"` |
+| `title` / `url` / `pwd` / `extra_text` | 资料元信息 |
+
+`tools.catalog.lookup()` 查询优先级:`goods_id > sku_id > keyword(最长命中)`。
 
 ---
 
@@ -298,6 +345,24 @@ def extract_card_code(text: str) -> str | None:
 
 ---
 
+## 7.5 登录态管理
+
+GUI 首页提供两种启动模式(下拉选择,默认根据 `storage_state.json` 是否存在自动判断):
+
+| 模式 | 行为 | 适用 |
+|---|---|---|
+| 使用上次扫码的登录态(reuse) | `BrowserSession` 加载 `storage_state.json`,直接进聊天页;若 cookies 已过期会被拼多多自动跳到 login 页,Bot 会自动等扫码完成后落盘 | 日常启动 |
+| 重新扫码登录(fresh / `force_relogin=True`) | 不加载 `storage_state.json`,context 干净启动,首次跳到 login 页 → 等扫码 → 立即落盘 | 换号/cookies 有问题手动重置 |
+
+支撑机制:
+- `BrowserSession.start()` 检测 URL 含 `/login` → 调 `_wait_login_then_save`,等 `wait_for_function('!location.href.includes("/login")')` 后立即 `save_storage_state()`。
+- `BrowserSession._periodic_save()` 每 5 分钟自动保存一次(防止意外退出丢失)。
+- 首页「💾 立即保存登录态」按钮可手动触发。
+- 首页「🗑 清除已保存的登录态」按钮删除 `storage_state.json`(Bot 停止时可用),会自动把下拉切到 fresh。
+- 浏览器卡在 login 页时,主循环把 GUI 状态切到 `awaiting_login`,首页有醒目提示。
+
+---
+
 ## 8. 风控与节流
 
 | 维度 | 限制 |
@@ -311,20 +376,90 @@ def extract_card_code(text: str) -> str | None:
 
 ---
 
-## 9. 路线图
+## 9. LangGraph 集成（LLM Agent 层）
+
+> 业务硬规则在 `core/stage.py` 决策完后,把 (stage, context, deps) 交给 LLM 层。
+> 每个 stage 用 `langchain.agents.create_agent`（langchain 1.x 推荐）独立成图,
+> 该 stage 仅暴露其允许的工具子集,LangGraph 自动跑 LLM ↔ tool 循环。
+
+```
+┌──────────────────────────────────────────────────────┐
+│ core/stage.py（业务规则,我们控制,不让 LLM 决策）      │
+│   decide_stage(uid, msg, orders, store)              │
+│   → ("S2_GUIDE", {"order": {...}})                   │
+└────────────────────┬─────────────────────────────────┘
+                     │
+                     ▼
+┌──────────────────────────────────────────────────────┐
+│ llm/runner.py                                        │
+│   run_stage(stage, context, deps) -> reply_text      │
+│      ↓                                               │
+│   llm/agent.py: build_agent(stage, deps)             │
+│      ↓ create_agent(model, tools=stage_tools, prompt)│
+│   ┌──────┐  tool_call?  ┌──────────┐                 │
+│   │agent │──yes────────▶│ ToolNode │                 │
+│   │ node │◀──result─────│          │                 │
+│   └──┬───┘              └──────────┘                 │
+│      │ no                                            │
+│      ▼                                               │
+│   AIMessage.content → 返回最终回复                    │
+└──────────────────────────────────────────────────────┘
+```
+
+### 9.1 每 stage 的 tools 集合
+
+| Stage | tools |
+|---|---|
+| S0_GREET | `send_text`, `escalate_to_human` |
+| S1_CONSULT | `send_text`, `escalate_to_human` |
+| S2_GUIDE | `send_card_code_guide`, `send_text`, `escalate_to_human` |
+| S3_REDEEM | `submit_card_code`, `send_text`, `escalate_to_human` |
+| S4_DELIVER | `lookup_product_url`, `send_text`, `escalate_to_human` |
+
+### 9.2 deps 注入
+
+LangChain `@tool` 装饰器的工具通过 **closure** 拿到运行时依赖,不读全局,方便单测：
+
+```python
+def make_stage_tools(stage: str, deps: dict) -> list:
+    @tool
+    def send_text(text: str) -> str:
+        ...
+        store = deps["store"]
+        store.log_action(...)
+    ...
+```
+
+deps 必填字段:`store`, `uid`, `stage`, `browser`(可空), `dry_run`(bool)。
+
+### 9.3 当前实现状态
+
+- ✅ `llm/client.py` `prompts.py` `tools.py` `agent.py` `runner.py` 全部就绪
+- ✅ 离线 smoke test 通过(`python -m llm._smoke_test`)
+- ⏳ tools 中的 `send_text` / `send_card_code_guide` / `submit_card_code` 当前是 **stub**,
+     等 `runtime/browser.py` 接入后替换为真实 Playwright 操作(签名保持不变)。
+
+---
+
+## 10. 路线图
 
 | 步骤 | 内容 | 状态 |
 |---|---|---|
 | 0 | 项目骨架、登录脚本、探查脚本 | ✅ |
-| 1 | 用户跑探查抓 selector + 接口（含核销页 URL） | ⏳ 等数据 |
-| 2 | `config.py` + `.env` + DeepSeek 配置 | ✅ |
-| 3 | `tools/catalog.py` + `catalog_admin.py` 管理 CLI + 映射表模板 | ✅ |
-| 4 | `core/store.py`：SQLite 状态库 | ✅ |
-| 5 | `runtime/`：browser + network 监听 + selectors 落地 | ⏳ 等数据 |
-| 6 | `core/stage.py`：状态机决策器 + 单测 | 待做 |
-| 7 | `tools/messaging.py`：send_text / send_image / send_card_code_guide | ⏳ 等 selector |
-| 8 | `tools/orders.py`：list / refresh | 待做 |
-| 9 | `tools/redeem.py`：核销自动化 | ⏳ 等核销页探查 |
-| 10 | `llm/`：DeepSeek 客户端 + prompt + agent loop | 待做 |
-| 11 | `bot.py`：装配 + 主循环 + 节流 + 风控 | 待做 |
-| 12 | 全量上线 + 观察调试 | 待做 |
+| 1 | 跑探查抓 selector + 接口（核销页 URL 已知） | ⏳ 等数据 |
+| 2 | `core/config.py` + `.env` + DeepSeek + BOT_ENABLED/DRY_RUN 开关 | ✅ |
+| 3 | `tools/catalog.py` + 映射表(catalog_item DB 表) + GUI 商品页 | ✅ |
+| 4 | `core/store.py`：SQLite 状态库（含 settings / stage_config / catalog_item） | ✅ |
+| 5 | `llm/`：DeepSeek + LangGraph create_agent（5 个 stage） | ✅ |
+| 5b | GUI:首页/日志/商品/模型/阶段/飞书 | ✅ |
+| 6 | `core/stage.py`：状态机（D1~D7 决策） | 待做 |
+| 7 | `tools/notify.py`：飞书 webhook 通知 | ✅ |
+| 8 | `runtime/browser.py` `network.py` `selectors.py` | ⏳ 等 selector |
+| 9 | `tools/messaging.py`：替换 llm/tools.py 里的 stub | ⏳ 等 selector |
+| 10 | `tools/orders.py`：被动监听 + 主动重放 userAllOrder | 待做 |
+| 11 | `tools/redeem.py`：核销页自动化 | ⏳ 等核销页探查 |
+| 12 | `bot.py`：装配 + 主循环 + 节流 + 对话锁 | 待做 |
+| 13 | 健康检查：每小时跑 selector 探针 | 待做 |
+| 14 | 每日报表：23:00 汇总 action_log | 待做 |
+| 15 | 先 DRY_RUN 跑 1~2 天审核质量 | 待做 |
+| 16 | 全量上线 | 待做 |

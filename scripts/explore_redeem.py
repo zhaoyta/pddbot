@@ -8,9 +8,9 @@
     5. 核销记录表格 selector
     6. 提交核销时的 HTTP API（路径、参数、响应）—— 用来确认核销结果
 
-用法：
-    1. 已经跑过 login.py，根目录有 storage_state.json
-    2. python explore_redeem.py
+用法（均在项目根目录执行）：
+    1. 根目录已有 ``storage_state.json``（由 GUI 登录流程生成）
+    2. ``uv run python scripts/explore_redeem.py``
     3. 按提示在弹出的浏览器里【手动完整跑一次核销】：
         a. 输入一个真实的核销码 → 点【获取订单信息】
         b. 等订单信息出来，点【开始核销】
@@ -29,11 +29,18 @@ import signal
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from loguru import logger
 from playwright.sync_api import sync_playwright, Request, Response
 
-import config
+from core import config
+from core import settings as settings_mod
+from core import store as store_mod
 
 
 def _ts() -> str:
@@ -41,15 +48,21 @@ def _ts() -> str:
 
 
 def main() -> None:
-    if not config.STORAGE_STATE_PATH.exists():
-        logger.error("没找到 storage_state.json，请先运行 `python login.py` 完成扫码登录")
+    store_mod.get()
+    settings_mod.initialize_from_env()
+    sspath = settings_mod.storage_state_path()
+    cap_dir = settings_mod.captures_dir()
+    redeem_url = settings_mod.redeem_page_url()
+
+    if not sspath.exists():
+        logger.error("没找到 {},请先通过 GUI 登录生成 storage_state.json", sspath)
         sys.exit(1)
 
     run_id = _ts()
-    dom_path = config.CAPTURES_DIR / f"redeem_dom_{run_id}.json"
-    dom_latest = config.CAPTURES_DIR / f"redeem_dom_latest_{run_id}.json"
-    http_path = config.CAPTURES_DIR / f"redeem_http_{run_id}.jsonl"
-    console_path = config.CAPTURES_DIR / f"redeem_console_{run_id}.log"
+    dom_path = cap_dir / f"redeem_dom_{run_id}.json"
+    dom_latest = cap_dir / f"redeem_dom_latest_{run_id}.json"
+    http_path = cap_dir / f"redeem_http_{run_id}.jsonl"
+    console_path = cap_dir / f"redeem_console_{run_id}.log"
 
     http_fp = http_path.open("a", encoding="utf-8")
     console_fp = console_path.open("a", encoding="utf-8")
@@ -69,7 +82,7 @@ def main() -> None:
         context = browser.new_context(
             user_agent=config.USER_AGENT,
             viewport=config.VIEWPORT,
-            storage_state=str(config.STORAGE_STATE_PATH),
+            storage_state=str(sspath),
         )
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -153,8 +166,8 @@ def main() -> None:
         )
 
         # ---- 打开核销页 ----
-        logger.info("打开核销页：{}", config.REDEEM_PAGE_URL)
-        page.goto(config.REDEEM_PAGE_URL, wait_until="domcontentloaded")
+        logger.info("打开核销页：{}", redeem_url)
+        page.goto(redeem_url, wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
 
         # ---- DOM 探针 ----

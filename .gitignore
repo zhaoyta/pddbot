@@ -5,6 +5,8 @@ __pycache__/
 storage_state.json
 logs/
 captures/
+*.db
+.uv/
 .DS_Store
 .idea/
 .vscode/

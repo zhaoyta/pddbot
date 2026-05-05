@@ -4,14 +4,13 @@
     在不发任何消息的前提下，被动观察拼多多商家客服页面，把以下信息落盘，
     供后续设计自动监听 / 自动回复方案使用：
 
-    1. 所有 WebSocket 帧（请求 URL、收发方向、payload）→ captures/ws_*.jsonl
-    2. 所有 XHR / fetch 请求摘要                         → captures/http_*.jsonl
-    3. 关键 DOM 选择器探测结果                           → captures/dom_probe.json
-    4. 控制台日志                                        → captures/console.log
+    1. 所有 XHR / fetch 请求摘要                         → captures/http_*.jsonl
+    2. 关键 DOM 选择器探测结果                           → captures/dom_probe.json
+    3. 控制台日志                                        → captures/console.log
 
-用法：
-    1. 先跑过 login.py，确保根目录已有 storage_state.json
-    2. python explore.py
+用法（均在项目根目录执行）：
+    1. 已通过 GUI 完成登录,根目录已有 ``storage_state.json``
+    2. ``uv run python scripts/explore.py``
     3. 让浏览器停在聊天页面，正常收一两条客户消息后按 Ctrl+C 结束。
 """
 from __future__ import annotations
@@ -23,10 +22,16 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from loguru import logger
-from playwright.sync_api import sync_playwright, WebSocket, Request, Response
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-import config
+from loguru import logger
+from playwright.sync_api import sync_playwright, Request, Response
+
+from core import config
+from core import settings as settings_mod
+from core import store as store_mod
 
 
 # ---------- 工具 ----------
@@ -35,36 +40,30 @@ def _ts() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def _safe_text(payload: str | bytes) -> str:
-    if isinstance(payload, bytes):
-        try:
-            return payload.decode("utf-8", errors="replace")
-        except Exception:
-            return f"<bytes:{len(payload)}>"
-    return payload
-
-
 # ---------- 主流程 ----------
 
 def main() -> None:
-    if not config.STORAGE_STATE_PATH.exists():
-        logger.error("没找到 storage_state.json，请先运行 `python login.py` 完成扫码登录")
+    store_mod.get()
+    settings_mod.initialize_from_env()
+    sspath = settings_mod.storage_state_path()
+    cap_dir = settings_mod.captures_dir()
+    chat_url = settings_mod.chat_url()
+
+    if not sspath.exists():
+        logger.error("没找到 {},请先通过 GUI 登录生成 storage_state.json", sspath)
         sys.exit(1)
 
     run_id = _ts()
-    ws_log = config.CAPTURES_DIR / f"ws_{run_id}.jsonl"
-    http_log = config.CAPTURES_DIR / f"http_{run_id}.jsonl"
-    chat_log = config.CAPTURES_DIR / f"chat_{run_id}.jsonl"  # 仅 chat/* 相关接口
-    console_log = config.CAPTURES_DIR / f"console_{run_id}.log"
-    dom_probe_path = config.CAPTURES_DIR / f"dom_probe_{run_id}.json"
+    http_log = cap_dir / f"http_{run_id}.jsonl"
+    chat_log = cap_dir / f"chat_{run_id}.jsonl"  # 仅 chat/* 相关接口
+    console_log = cap_dir / f"console_{run_id}.log"
+    dom_probe_path = cap_dir / f"dom_probe_{run_id}.json"
 
     logger.add(config.LOGS_DIR / f"explore_{run_id}.log", rotation="10 MB")
     logger.info("本次 run id = {}", run_id)
-    logger.info("WS 日志：{}", ws_log)
     logger.info("HTTP 日志：{}", http_log)
     logger.info("Chat 接口日志（完整）：{}", chat_log)
 
-    ws_fp = ws_log.open("a", encoding="utf-8")
     http_fp = http_log.open("a", encoding="utf-8")
     chat_fp = chat_log.open("a", encoding="utf-8")
     console_fp = console_log.open("a", encoding="utf-8")
@@ -84,7 +83,7 @@ def main() -> None:
         context = browser.new_context(
             user_agent=config.USER_AGENT,
             viewport=config.VIEWPORT,
-            storage_state=str(config.STORAGE_STATE_PATH),
+            storage_state=str(sspath),
         )
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
@@ -92,45 +91,7 @@ def main() -> None:
 
         page = context.new_page()
 
-        # ---- 1. WebSocket 监听 ----
-        def on_websocket(ws: WebSocket) -> None:
-            logger.info("[WS open] {}", ws.url)
-            write_jsonl(ws_fp, {"event": "open", "url": ws.url, "t": time.time()})
-
-            ws.on(
-                "framereceived",
-                lambda payload: write_jsonl(
-                    ws_fp,
-                    {
-                        "event": "recv",
-                        "url": ws.url,
-                        "t": time.time(),
-                        "payload": _safe_text(payload),
-                    },
-                ),
-            )
-            ws.on(
-                "framesent",
-                lambda payload: write_jsonl(
-                    ws_fp,
-                    {
-                        "event": "send",
-                        "url": ws.url,
-                        "t": time.time(),
-                        "payload": _safe_text(payload),
-                    },
-                ),
-            )
-            ws.on(
-                "close",
-                lambda: write_jsonl(
-                    ws_fp, {"event": "close", "url": ws.url, "t": time.time()}
-                ),
-            )
-
-        page.on("websocket", on_websocket)
-
-        # ---- 2. HTTP 请求监听 ----
+        # ---- 1. HTTP 请求监听 ----
         # 命中以下关键字时认为是"聊天/订单/客户上下文"相关接口，单独记录、完整保存
         CHAT_KEYWORDS = (
             # —— 聊天 ——
@@ -228,7 +189,7 @@ def main() -> None:
         page.on("request", on_request)
         page.on("response", on_response)
 
-        # ---- 3. 控制台日志 ----
+        # ---- 2. 控制台日志 ----
         page.on(
             "console",
             lambda msg: console_fp.write(
@@ -237,12 +198,12 @@ def main() -> None:
             or console_fp.flush(),
         )
 
-        # ---- 4. 进入聊天页 ----
-        logger.info("打开聊天页：{}", config.CHAT_URL)
-        page.goto(config.CHAT_URL, wait_until="domcontentloaded")
+        # ---- 3. 进入聊天页 ----
+        logger.info("打开聊天页：{}", chat_url)
+        page.goto(chat_url, wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
 
-        # ---- 5. DOM 探针（重点找：会话列表项 / 输入框 / 发送按钮）----
+        # ---- 4. DOM 探针（重点找：会话列表项 / 输入框 / 发送按钮）----
         probe_script = r"""
         () => {
             // 工具：拿元素的关键描述
@@ -365,7 +326,7 @@ def main() -> None:
         }
         """
         # 启动时先跑一次（多半还没选会话，输入框为空也无所谓，作初始基线）
-        dom_probe_latest = config.CAPTURES_DIR / f"dom_probe_latest_{run_id}.json"
+        dom_probe_latest = cap_dir / f"dom_probe_latest_{run_id}.json"
         try:
             probe = page.evaluate(probe_script)
             dom_probe_path.write_text(
@@ -379,7 +340,7 @@ def main() -> None:
         except Exception as e:
             logger.warning("DOM 探针失败：{}", e)
 
-        # ---- 6. 注入 MutationObserver 把会话/消息变化打到 console ----
+        # ---- 5. 注入 MutationObserver 把会话/消息变化打到 console ----
         observer_script = r"""
         () => {
             if (window.__pddbot_observer__) return 'already';
@@ -406,9 +367,9 @@ def main() -> None:
         except Exception as e:
             logger.warning("注入 MutationObserver 失败：{}", e)
 
-        # ---- 7. 阻塞，等用户操作 ----
+        # ---- 6. 阻塞，等用户操作 ----
         print("\n" + "=" * 78)
-        print("浏览器已打开聊天页，正在抓取 WS / HTTP / DOM 数据。")
+        print("浏览器已打开聊天页，正在抓取 HTTP / DOM 数据。")
         print("请按以下顺序操作（顺序不能省，否则后面写代码缺数据）：")
         print()
         print("  [1] 切 2~3 个会话（让 chat/list 多触发几次）")
@@ -452,7 +413,6 @@ def main() -> None:
                     except Exception as e:
                         logger.debug("周期性 DOM 探针失败：{}", e)
         finally:
-            ws_fp.close()
             http_fp.close()
             chat_fp.close()
             console_fp.close()
@@ -465,7 +425,6 @@ def main() -> None:
     logger.success("  - {}  ★ 监听新消息用", chat_log)
     logger.success("  - {}  ★ 发送消息用（请确认抓的是已选好会话的状态）", dom_probe_latest)
     logger.success("  - {}", dom_probe_path)
-    logger.success("  - {}", ws_log)
     logger.success("  - {}", http_log)
     logger.success("  - {}", console_log)
 

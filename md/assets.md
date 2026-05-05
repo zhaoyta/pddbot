@@ -15,10 +15,10 @@
 
 ## 引用方式
 
-代码里通过 `config.CARD_CODE_GUIDE_IMAGE` 路径引用：
+代码里通过 ``core.config.CARD_CODE_GUIDE_IMAGE`` 路径引用：
 
 ```python
-from config import CARD_CODE_GUIDE_IMAGE
+from core.config import CARD_CODE_GUIDE_IMAGE
 send_image(uid, str(CARD_CODE_GUIDE_IMAGE))
 ```
 

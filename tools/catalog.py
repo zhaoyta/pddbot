@@ -1,111 +1,100 @@
-"""商品 → 资料链接 映射查询
+"""商品 → 资料全文 映射查询（数据源:SQLite catalog_item 表）
 
-数据源：catalog/product_map.json
-查询优先级：by_sku_id > by_goods_id > by_keyword（最长命中）
+查询优先级:goods_id > sku_id > keyword（最长命中）
 
-使用方式：
+每条映射仅存 ``share_body``：百度网盘「复制全文」的整段话术（不拆字段）。
+
+使用方式:
     from tools import catalog
-    item = catalog.lookup(sku_id=1876675563671)
-    item = catalog.lookup(goods_name="【系统教学】散打基础教程视频版")
+    item = catalog.lookup(goods_id=928035245974)
+    print(item.to_message())
 """
 from __future__ import annotations
 
-import json
-import threading
+import re
 from dataclasses import dataclass
 from typing import Any
 
-import config
+from core import store as store_mod
 
-_lock = threading.RLock()
-_cache: dict[str, Any] | None = None
-_mtime: float | None = None
+_PAN_LINK_RE = re.compile(
+    r"https://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(?:\?[^\s]+)?",
+    re.IGNORECASE,
+)
+_PWD_IN_URL_RE = re.compile(r"[?&]pwd=([^&\s]+)", re.IGNORECASE)
 
 
 @dataclass
 class CatalogItem:
-    title: str
-    url: str
-    pwd: str
-    extra_text: str = ""
+    share_body: str
+
+    @property
+    def title(self) -> str:
+        """首行摘要，供模板变量 ``title`` / 日志。"""
+        for line in (self.share_body or "").split("\n"):
+            t = line.strip()
+            if t:
+                return t[:160]
+        return ""
+
+    @property
+    def pwd(self) -> str:
+        """从 ``share_url`` 查询串解析提取码（若有）。"""
+        u = self.share_url
+        m = _PWD_IN_URL_RE.search(u)
+        return m.group(1) if m else ""
+
+    @property
+    def share_url(self) -> str:
+        """从正文正则抽出第一条 ``pan.baidu.com`` 链接。"""
+        sb = (self.share_body or "").strip()
+        if not sb:
+            return ""
+        m = _PAN_LINK_RE.search(sb)
+        if m:
+            return m.group(0).rstrip(".,;，。）)")
+        return ""
 
     def to_message(self) -> str:
-        """生成给客户的回复文本（按百度网盘分享格式）。"""
-        parts = [
-            f"亲，您订购的【{self.title}】资料如下：",
-            f"链接：{self.url}",
-            f"提取码：{self.pwd}",
-        ]
-        if self.extra_text:
-            parts.append(self.extra_text)
-        return "\n".join(parts)
+        return (self.share_body or "").strip()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "title": self.title,
+            "url": self.share_url,
+            "pwd": self.pwd,
+            "message": self.to_message(),
+        }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "CatalogItem":
-        return cls(
-            title=d.get("title", ""),
-            url=d.get("url", ""),
-            pwd=d.get("pwd", ""),
-            extra_text=d.get("extra_text", ""),
-        )
-
-
-def _load() -> dict[str, Any]:
-    """加载 product_map.json，文件 mtime 变化时自动重载。"""
-    global _cache, _mtime
-    path = config.PRODUCT_MAP_PATH
-    if not path.exists():
-        return {"by_sku_id": {}, "by_goods_id": {}, "by_keyword": []}
-
-    cur_mtime = path.stat().st_mtime
-    with _lock:
-        if _cache is None or _mtime != cur_mtime:
-            _cache = json.loads(path.read_text(encoding="utf-8"))
-            _mtime = cur_mtime
-    return _cache  # type: ignore[return-value]
+    def from_row(cls, row: Any) -> "CatalogItem":
+        rd = {k: row[k] for k in row.keys()}
+        return cls(share_body=(rd.get("share_body") or ""))
 
 
 def lookup(
-    sku_id: int | str | None = None,
     goods_id: int | str | None = None,
+    sku_id: int | str | None = None,
     goods_name: str | None = None,
 ) -> CatalogItem | None:
-    """按优先级查找映射。命中返回 CatalogItem，否则 None。"""
-    data = _load()
-
-    if sku_id is not None:
-        hit = data.get("by_sku_id", {}).get(str(sku_id))
-        if hit:
-            return CatalogItem.from_dict(hit)
-
-    if goods_id is not None:
-        hit = data.get("by_goods_id", {}).get(str(goods_id))
-        if hit:
-            return CatalogItem.from_dict(hit)
-
-    if goods_name:
-        # 关键字最长命中
-        best: tuple[int, dict] | None = None
-        for entry in data.get("by_keyword", []):
-            for kw in entry.get("match", []):
-                if kw and kw in goods_name:
-                    score = len(kw)
-                    if best is None or score > best[0]:
-                        best = (score, entry)
-        if best:
-            return CatalogItem.from_dict(best[1])
-
-    return None
+    """按优先级查找映射:goods_id > sku_id > keyword(最长命中)。"""
+    s = store_mod.get()
+    row = s.find_catalog(goods_id=goods_id, sku_id=sku_id, goods_name=goods_name)
+    if row is None:
+        return None
+    return CatalogItem.from_row(row)
 
 
-def all_entries() -> dict[str, Any]:
-    """完整数据，给管理脚本用。"""
-    return _load()
-
-
-def reload() -> None:
-    """强制重载（管理脚本写完后调用）。"""
-    global _cache, _mtime
-    with _lock:
-        _cache = None
-        _mtime = None
+def all_items() -> list[dict[str, Any]]:
+    """GUI 商品页 + 调试用。"""
+    s = store_mod.get()
+    return [
+        {
+            "id": r["id"],
+            "match_type": r["match_type"],
+            "match_value": r["match_value"],
+            "share_body": r["share_body"] or "",
+            "updated_at": r["updated_at"],
+        }
+        for r in s.list_catalog_items()
+    ]
