@@ -40,9 +40,9 @@
 
 ### 使用指导（GUI）
 
-启动后在 **首页** 选择登录方式（推荐使用已保存的登录态），点击 **「启动机器人」** 开始监听与自动回复；左侧可进入「日志」等页面查看运行记录。
-
-![pddbot 使用指导：首页启动机器人](assets/@assets/guide.gif)
+<p align="center">
+  <img src="./assets/@assets/guide.gif" alt="pddbot：首页选择登录方式并点击「启动机器人」" width="920" />
+</p>
 
 ### 环境变量
 
