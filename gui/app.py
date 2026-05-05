@@ -14,25 +14,28 @@ from PySide6.QtWidgets import QApplication
 
 from core import config
 from core import settings, store
-from core.llm_log_sink import configure_llm_log_sink
+from core.llm_log_sink import configure_llm_log_sink, exclude_llm_trace_filter
 from gui.main_window import MainWindow
+from gui.pages.logs import install_gui_log_sink
 
 
 def main() -> int:
     # 1. 配置日志：写文件 + GUI 日志页面
     logger.remove()
-    logger.add(sys.stderr, level="INFO")
+    logger.add(sys.stderr, level="INFO", filter=exclude_llm_trace_filter)
     logger.add(
         config.LOGS_DIR / "pddbot_{time:YYYYMMDD}.log",
         rotation="10 MB",
         retention="14 days",
         level="DEBUG",
+        filter=exclude_llm_trace_filter,
     )
 
     # 2. 初始化 DB + settings 表（首次启动从 .env 灌默认值）
     store.get()
     settings.initialize_from_env()
     configure_llm_log_sink()
+    install_gui_log_sink()
     logger.info("数据库已就绪：{}", config.DB_PATH)
 
     # 3. 启 Qt

@@ -16,6 +16,7 @@
 |---|---|
 | `@assets/gerenerweima.JPG` | 微信加好友二维码（加群前先添加，备注 **PDDBOT**） |
 | `@assets/dashang.JPG` | 微信支付自愿打赏二维码 |
+| `@assets/guide.gif` | README 使用指导动图（首页启动机器人） |
 
 ## 命名约定
 

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import config
+from core.llm_log_sink import exclude_llm_trace_filter
 
 
 _LEVEL_COLORS = {
@@ -44,8 +45,28 @@ def _gui_sink(message) -> None:
     _emitter.line.emit(rec["level"].name, text)
 
 
-# 安装一次全局 sink，让 GUI 可以拿到所有日志
-logger.add(_gui_sink, level="DEBUG", format="{time:HH:mm:ss} | {level:<7} | {message}")
+_GUI_LOG_HANDLER_ID: int | None = None
+
+
+def install_gui_log_sink() -> None:
+    """须在 ``gui.app.main()`` 里 ``logger.remove()`` 并完成其它 sink 之后再调用。
+
+    若在模块 import 时 ``logger.add(_gui_sink)``，会被随后的 ``logger.remove()`` 一并删掉，
+    导致「日志」页始终空白。
+    """
+    global _GUI_LOG_HANDLER_ID
+    if _GUI_LOG_HANDLER_ID is not None:
+        try:
+            logger.remove(_GUI_LOG_HANDLER_ID)
+        except ValueError:
+            pass
+        _GUI_LOG_HANDLER_ID = None
+    _GUI_LOG_HANDLER_ID = logger.add(
+        _gui_sink,
+        level="DEBUG",
+        format="{time:HH:mm:ss} | {level:<7} | {message}",
+        filter=exclude_llm_trace_filter,
+    )
 
 
 class LogsPage(QWidget):

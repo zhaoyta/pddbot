@@ -26,6 +26,11 @@ def _llm_only_filter(record: dict[str, Any]) -> bool:
     return "[LLM交互]" in msg or "[LLM回调]" in msg
 
 
+def exclude_llm_trace_filter(record: dict[str, Any]) -> bool:
+    """供控制台 / GUI 日志等 sink 使用：不写 [LLM交互]、[LLM回调]（这两项仅进 llm_message 专用文件）。"""
+    return not _llm_only_filter(record)
+
+
 def default_llm_log_pattern() -> str:
     """与 GUI 占位符一致的默认相对路径（相对项目根）。"""
     return f"logs/llm_message_{{time:YYYYMMDD}}.log"
