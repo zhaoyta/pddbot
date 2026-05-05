@@ -19,6 +19,11 @@ if TYPE_CHECKING:
 _MAX_CHARS = 2000
 
 
+def _normalize_chat_outbound_text(text: str) -> str:
+    """会话框用 press_sequentially 逐字输入时，换行符会触发与回车相同的发送，一条话拆成多条气泡。"""
+    return " ".join((text or "").split()).strip()
+
+
 def _iter_frames(page: "Page") -> list:
     """主 frame 优先,再扫子 frame(部分运营组件在 iframe)."""
     out = [page.main_frame]
@@ -259,7 +264,7 @@ async def send_chat_message(
     max_delay: int = 92,
 ) -> tuple[bool, str | None]:
     """在已打开会话页:选右侧主输入框 → 模拟敲键 → 点「发送」(含祖先内 DOM 点击)."""
-    text = (text or "").strip()
+    text = _normalize_chat_outbound_text(text or "")
     if not text:
         return False, "empty_reply"
     if len(text) > _MAX_CHARS:

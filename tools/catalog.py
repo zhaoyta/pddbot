@@ -2,7 +2,8 @@
 
 查询优先级:goods_id > sku_id > keyword（最长命中）
 
-每条映射仅存 ``share_body``：百度网盘「复制全文」的整段话术（不拆字段）。
+每条映射存 ``share_body``（百度网盘「复制全文」整段话术），另可有可选字段
+``product_url`` / ``description`` 供 LLM 与 GUI；未填时仍可从 ``share_body`` 解析链接与首行摘要。
 
 使用方式:
     from tools import catalog
@@ -27,6 +28,8 @@ _PWD_IN_URL_RE = re.compile(r"[?&]pwd=([^&\s]+)", re.IGNORECASE)
 @dataclass
 class CatalogItem:
     share_body: str
+    explicit_product_url: str = ""
+    explicit_description: str = ""
 
     @property
     def title(self) -> str:
@@ -36,13 +39,6 @@ class CatalogItem:
             if t:
                 return t[:160]
         return ""
-
-    @property
-    def pwd(self) -> str:
-        """从 ``share_url`` 查询串解析提取码（若有）。"""
-        u = self.share_url
-        m = _PWD_IN_URL_RE.search(u)
-        return m.group(1) if m else ""
 
     @property
     def share_url(self) -> str:
@@ -55,13 +51,34 @@ class CatalogItem:
             return m.group(0).rstrip(".,;，。）)")
         return ""
 
+    @property
+    def product_url(self) -> str:
+        """对外使用的资料链接：库内显式字段优先，否则退回正文解析。"""
+        u = (self.explicit_product_url or "").strip()
+        return u if u else self.share_url
+
+    @property
+    def description(self) -> str:
+        """简短描述：库内显式字段优先，否则退回首行摘要。"""
+        d = (self.explicit_description or "").strip()
+        return d if d else self.title
+
+    @property
+    def pwd(self) -> str:
+        """从 ``product_url`` 查询串解析提取码（若有）。"""
+        u = self.product_url
+        m = _PWD_IN_URL_RE.search(u)
+        return m.group(1) if m else ""
+
     def to_message(self) -> str:
         return (self.share_body or "").strip()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "title": self.title,
-            "url": self.share_url,
+            "url": self.product_url,
+            "product_url": self.product_url,
+            "description": self.description,
             "pwd": self.pwd,
             "message": self.to_message(),
         }
@@ -69,7 +86,11 @@ class CatalogItem:
     @classmethod
     def from_row(cls, row: Any) -> "CatalogItem":
         rd = {k: row[k] for k in row.keys()}
-        return cls(share_body=(rd.get("share_body") or ""))
+        return cls(
+            share_body=(rd.get("share_body") or ""),
+            explicit_product_url=(rd.get("product_url") or "").strip(),
+            explicit_description=(rd.get("description") or "").strip(),
+        )
 
 
 def lookup(
@@ -88,13 +109,18 @@ def lookup(
 def all_items() -> list[dict[str, Any]]:
     """GUI 商品页 + 调试用。"""
     s = store_mod.get()
-    return [
-        {
-            "id": r["id"],
-            "match_type": r["match_type"],
-            "match_value": r["match_value"],
-            "share_body": r["share_body"] or "",
-            "updated_at": r["updated_at"],
-        }
-        for r in s.list_catalog_items()
-    ]
+    out: list[dict[str, Any]] = []
+    for r in s.list_catalog_items():
+        rd = {k: r[k] for k in r.keys()}
+        out.append(
+            {
+                "id": rd["id"],
+                "match_type": rd["match_type"],
+                "match_value": rd["match_value"],
+                "share_body": rd.get("share_body") or "",
+                "product_url": rd.get("product_url") or "",
+                "description": rd.get("description") or "",
+                "updated_at": rd["updated_at"],
+            },
+        )
+    return out

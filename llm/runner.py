@@ -30,6 +30,9 @@ from .agent import build_agent
 from .log_format import DEFAULT_MAX_OUT, clip_llm_log
 from .logging_callback import PddChatModelLogger
 
+# 全店商品资料索引注入长度上限（超出截断，避免 token 爆炸）
+_CATALOG_INDEX_MAX_CHARS = 16000
+
 # 模板模式可用占位符
 TEMPLATE_PLACEHOLDERS: dict[str, str] = {
     "customer_msg": "客户最新一条消息原文",
@@ -40,9 +43,53 @@ TEMPLATE_PLACEHOLDERS: dict[str, str] = {
     "sku_id": "SKU ID",
     "title": "资料标题(命中映射时有)",
     "share_url": "带 pwd 的百度网盘完整链接(命中映射时有)",
+    "product_url": "商品/资料链接(显式配置优先,命中映射时有)",
+    "description": "后台「描述」字段（未填为空；不向模板注入 share_body 首行）",
     "pwd": "百度网盘提取码(命中映射时有)",
     "material_message": "整段网盘分享文本(三行格式,命中映射时有)",
 }
+
+
+def _catalog_shop_index_block() -> str | None:
+    """注入全店商品映射的链接与后台描述，供咨询阶段匹配「有没有 xx 资料」等提问。
+
+    不按当前订单过滤；每条一行并带 ``match_type``/``match_value`` 便于对照关键字/商品 ID。
+    整段 share_body 永不注入（核销后发客户仍走 ``lookup_product_url`` / ``send_text``）。
+    """
+    try:
+        raw = catalog_mod.all_items()
+    except Exception as e:
+        logger.warning("[LLM] 读取 catalog_item 列表失败: {}", e)
+        return None
+    if not raw:
+        return None
+    rows = sorted(
+        raw,
+        key=lambda x: (
+            str(x.get("match_type") or ""),
+            str(x.get("match_value") or ""),
+        ),
+    )
+    lines = [
+        "【店铺商品资料索引】（全店条目：类型与匹配值 + 链接 + 后台「描述」。"
+        "客户问「有没有某类/某主题资料」时请在本索引中对照关键字、描述与匹配值作答；"
+        "不包含核销专用全文 share_body，发复制话术仅在核销后走工具。）",
+    ]
+    for it in rows:
+        ci = catalog_mod.CatalogItem(
+            share_body=(it.get("share_body") or ""),
+            explicit_product_url=(it.get("product_url") or "").strip(),
+            explicit_description=(it.get("description") or "").strip(),
+        )
+        pu = ci.product_url or "(无链接)"
+        desc = (ci.explicit_description or "").strip() or "未配置"
+        mt = it.get("match_type") or ""
+        mv = it.get("match_value") or ""
+        lines.append(f"- [{mt}={mv}] 链接: {pu} | 描述: {desc}")
+    text = "\n".join(lines)
+    if len(text) > _CATALOG_INDEX_MAX_CHARS:
+        text = text[:_CATALOG_INDEX_MAX_CHARS] + "\n…(索引过长已截断，可在 GUI 精简映射条目)"
+    return text
 
 
 def _build_user_message(stage: str, context: dict) -> str:
@@ -50,6 +97,7 @@ def _build_user_message(stage: str, context: dict) -> str:
 
     格式约定（保持紧凑,省 token）:
         【店铺知识库 QA】…（启用且有答复的条目，来自 qa_item 表）
+        【店铺商品资料索引】…（全店映射：链接+描述，不含 share_body）
         【客户最新消息】xxx
         【订单上下文】<json>
         【最近对话】<list>
@@ -63,6 +111,10 @@ def _build_user_message(stage: str, context: dict) -> str:
         qa_mem = ""
     if qa_mem:
         parts.append("【店铺知识库 QA】\n" + qa_mem)
+
+    idx = _catalog_shop_index_block()
+    if idx:
+        parts.append(idx)
 
     latest_msg = context.get("latest_message") or ""
     if latest_msg:
@@ -117,6 +169,7 @@ def _build_template_vars(context: dict) -> dict[str, str]:
     goods_name = g.get("goodsName") or ""
 
     title = share_url = pwd = material_message = ""
+    product_url = description = ""
     if goods_id or sku_id or goods_name:
         item = catalog_mod.lookup(
             goods_id=goods_id or None,
@@ -128,6 +181,8 @@ def _build_template_vars(context: dict) -> dict[str, str]:
             share_url = item.share_url
             pwd = item.pwd
             material_message = item.to_message()
+            product_url = item.product_url
+            description = (item.explicit_description or "").strip()
 
     return {
         "customer_msg": str(context.get("latest_message") or ""),
@@ -138,6 +193,8 @@ def _build_template_vars(context: dict) -> dict[str, str]:
         "sku_id": str(sku_id),
         "title": title,
         "share_url": share_url,
+        "product_url": product_url,
+        "description": description,
         "pwd": pwd,
         "material_message": material_message,
     }

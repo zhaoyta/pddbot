@@ -36,6 +36,52 @@ _LATEST_ORDERS: dict[str, dict[str, Any]] = {}
 _SYNC_LEFT_SCAN_LOCK = asyncio.Lock()
 
 
+async def _flush_buffered_send_text(deps: dict[str, Any], page: Any, dry_run: bool) -> None:
+    """将本轮 LLM 多次 ``send_text`` 调用合并为一条 DOM 消息发出。"""
+    parts = deps.pop("_send_text_parts", None)
+    if not parts:
+        return
+    # 用空格拼接：若用 \\n 合并，press_sequentially 会把换行当「回车发送」，拆成多条气泡
+    merged = " ".join(p for p in parts if p).strip()
+    if not merged:
+        return
+    if dry_run or page is None:
+        deps["_chat_sent_via_tool"] = True
+        logger.debug(
+            "[bot] send_text 队列已合并 len={} parts={} (dry_run 或无 page,跳过 DOM)",
+            len(merged),
+            len(parts),
+        )
+        return
+    from tools import messaging as msg_mod
+
+    ok, err = await msg_mod.send_chat_message(page, merged)
+    if ok:
+        deps["_chat_sent_via_tool"] = True
+        logger.info(
+            "[bot] send_text 队列已合并发送 len={} parts={}",
+            len(merged),
+            len(parts),
+        )
+        store = deps.get("store")
+        if (
+            deps.get("stage") == "S4_DELIVER"
+            and (deps.get("order_sn") or "").strip()
+            and store
+            and ("http" in merged or "pan.baidu.com" in merged)
+        ):
+            try:
+                store.mark_order_delivered(str(deps["order_sn"]).strip())
+            except Exception as e:
+                logger.warning("[bot] mark_order_delivered 失败: {}", e)
+    else:
+        logger.error(
+            "[bot] send_text 合并发送失败 err={} 预览:\n{}",
+            err,
+            merged[:240],
+        )
+
+
 async def _process_chat_msg(
     ev: dict[str, Any],
     *,
@@ -294,6 +340,8 @@ async def _process_chat_msg(
                 len(parts),
             )
 
+    await _flush_buffered_send_text(deps, page, dry_run)
+
     # 9) 写 action_log + (DRY_RUN 不真发) + 更新 conv_state
     s.log_action(
         uid=uid, stage=decided_stage, tool="llm_reply",
@@ -472,33 +520,15 @@ async def _after_sync_message(
                             preview[:120],
                         )
                     elif s.has_replied_to_incoming_msg_id(uid, msg_id):
-                        rows_ord = s.list_orders_of_uid(uid)
-                        o_sn = str(rows_ord[0]["order_sn"]) if rows_ord else ""
-                        delivered = bool(o_sn and s.is_order_delivered(o_sn))
-                        orig_mid = msg_id
-                        msg_id = f"sync_unread_{uid}_{_fp('reply_but_no_deliver')}"
-                        content = preview
-                        msg_type = 0
-                        ts = int(time.time())
-                        if delivered:
-                            logger.info(
-                                "[bot][sync] uid={} msg_id={} 游标对齐、摘要仍含库文且已接待；"
-                                "订单已 mark_order_delivered，仍左栏补跑（防复购/HTTP 滞后漏接待）"
-                                " synthetic_msg_id={} order_sn={!r}",
-                                uid,
-                                orig_mid,
-                                msg_id,
-                                o_sn or "-",
-                            )
-                        else:
-                            logger.info(
-                                "[bot][sync] uid={} msg_id={} 虽已接待但订单仍未发资料或无本地单,"
-                                "左栏补跑防漏链 synthetic_msg_id={} order_sn={!r}",
-                                uid,
-                                orig_mid,
-                                msg_id,
-                                o_sn or "-",
-                            )
+                        # 游标已对齐且摘要仍是同一条客户消息：左栏红点常为已回复后的残留，
+                        # 再合成 sync_unread_* 会重复跑 LLM（同一条提问答两次）。
+                        logger.info(
+                            "[bot][sync] uid={} msg_id={} 已接待且摘要仍为该条客户消息,"
+                            "跳过左栏合成补跑",
+                            uid,
+                            msg_id,
+                        )
+                        continue
                     else:
                         msg_id = f"sync_unread_{uid}_{_fp('preview_match_unread')}"
                         content = preview

@@ -69,14 +69,21 @@ pddbot/
 ├── uv.toml                  # 固化清华 PyPI 镜像源
 ├── .env.example             # 环境变量模板（GUI 启动后会写到 settings 表）
 ├── requirements.txt
+├── LICENSE                  # Apache License 2.0 全文
+├── CONTRIBUTING.md          # 贡献入口（详见 md/contributing.md）
+├── SECURITY.md              # 漏洞报告说明（GitHub Security）
+├── NOTICE                   # 版权与主要第三方依赖许可提示
 │
 └── md/
     ├── README.md            # 本文档
+    ├── contributing.md      # 贡献指南（环境、PR、安全披露）
+    ├── license.md           # Apache 2.0 说明与 NOTICE 入口
     ├── gui.md               # GUI 设计（页面/字段/数据流）
     ├── architecture.md      # 整体架构 + LangGraph 集成
     ├── protocol.md          # 拼多多接口字段速查
     ├── scripts.md           # scripts/ 探查脚本说明
-    └── assets.md            # 静态资源说明
+    ├── assets.md            # 静态资源说明
+    └── community.md         # 社区：加群、打赏（对外）
 ```
 
 ---
@@ -228,11 +235,28 @@ uv run python -m llm._smoke_test
 
 ## 7. 已知风险与注意事项
 
-- **拼多多商家后台风控较严**，长时间高频自动回复有封号风险。`.env` 默认值已经做了节流：
-  - 单条回复随机 1.5 ~ 3.5 秒延迟
-  - 全店 30 条/分钟、单 uid 3 条/分钟
-  - 夜间 23:00 ~ 08:00 静默
-  - 敏感词（"投诉 / 曝光 / 12315 / 链接失效"等）自动转人工
+- **拼多多商家后台风控较严**，长时间高频自动回复有封号风险。当前实现中：
+  - **未实现**：收到消息后「先随机等待 1.5～3.5 秒再回复」、全店/单 uid **每分钟条数上限**、**夜间时段静默**（`.env` 里 `REPLY_DELAY_*`、`RATE_LIMIT_*` 会映射进 `settings` 表，但 **`bot.py` 主循环尚未读取**，属预留字段）。
+  - **已有**：`tools/messaging.py` 在输入框内逐字输入时有随机间隔（与「整句回复前等待」不是同一层）；浏览器启动温身延迟见 GUI「风控」页 / `browser.warmup_delay_*`。
+  - **规则转人工**：`core/stage.py` 命中敏感词或售后等 → `S_HUMAN`，当前为 **飞书告警 + 写 `action_log`**，不向买家自动带固定「已转人工」话术（除非后续你在 LLM/工具里发送）。
 - 页面 DOM / 接口可能随拼多多前端发版变动，定期重跑 `scripts/explore.py` 校准。
 - `BOT_ENABLED=false` 是紧急止损总开关；`DRY_RUN=true` 让 LLM 生成回复但不实际发送，只写 `action_log` 供人工审核。
 - 仅供 **自有店铺自用**，请遵守平台规则与相关法律法规。
+
+---
+
+## 社区与交流
+
+加微信群：请先扫 **[`md/community.md`](community.md)** 中的好友码，申请备注 **`PDDBOT`**，通过后拉群。自愿打赏见同页。
+
+---
+
+## 参与贡献
+
+见 **[`md/contributing.md`](contributing.md)**；漏洞报告见仓库根目录 **`SECURITY.md`**。
+
+---
+
+## 开源许可
+
+本项目采用 Apache License 2.0，详见 [license.md](license.md) 与仓库根目录 `LICENSE`。

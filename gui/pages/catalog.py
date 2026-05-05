@@ -42,7 +42,7 @@ class CatalogEditDialog(QDialog):
                  row_data: dict[str, Any] | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("编辑商品映射" if row_data else "新增商品映射")
-        self.resize(540, 420)
+        self.resize(560, 520)
         self._row_id: int | None = row_data["id"] if row_data else None
 
         form = QFormLayout()
@@ -71,8 +71,22 @@ class CatalogEditDialog(QDialog):
         if row_data:
             self.te_share.setPlainText(row_data.get("share_body") or "")
 
+        self.le_product_url = QLineEdit()
+        self.le_product_url.setPlaceholderText(
+            "可选。留空则从资料全文自动解析百度网盘链接"
+        )
+        self.le_description = QLineEdit()
+        self.le_description.setPlaceholderText(
+            "建议填写：咨询时仅本字段与「商品链接」会进入 LLM（整段 share_body 仅核销后发客户）"
+        )
+        if row_data:
+            self.le_product_url.setText(row_data.get("product_url") or "")
+            self.le_description.setText(row_data.get("description") or "")
+
         form.addRow("匹配类型", self.cb_type)
         form.addRow("匹配值", self.le_value)
+        form.addRow("商品链接", self.le_product_url)
+        form.addRow("描述", self.le_description)
         form.addRow("资料全文 share_body", self.te_share)
 
         btns = QDialogButtonBox(
@@ -89,6 +103,8 @@ class CatalogEditDialog(QDialog):
         match_type = self.cb_type.currentData()
         match_value = self.le_value.text().strip()
         share_body = self.te_share.toPlainText().strip()
+        product_url = self.le_product_url.text().strip()
+        description = self.le_description.text().strip()
 
         if not match_value:
             QMessageBox.warning(self, "校验", "匹配值不能为空")
@@ -103,6 +119,8 @@ class CatalogEditDialog(QDialog):
                 match_value=match_value,
                 share_body=share_body,
                 item_id=self._row_id,
+                product_url=product_url,
+                description=description,
             )
         except Exception as e:
             QMessageBox.critical(self, "保存失败", str(e))
@@ -130,7 +148,8 @@ class CatalogPage(QWidget):
 
         desc = QLabel(
             "命中规则:商品 ID → SKU ID → 关键字(最长命中)。"
-            "表 catalog_item 仅存 share_body（整段百度网盘话术）。旧库首次启动会自动合并迁移。"
+            "每条含 share_body（发给客户的整段话术），另有可选「商品链接」「描述」供 LLM 与列表展示；"
+            "未填时启动时会从 share_body 尝试解析/回填。"
         )
         desc.setStyleSheet("color:#888;")
         desc.setWordWrap(True)
@@ -158,10 +177,10 @@ class CatalogPage(QWidget):
         self.btn_refresh.clicked.connect(self.refresh)
         self.btn_test.clicked.connect(self.on_test_match)
 
-        # 表格：类型 | 匹配值 | 资料全文摘要
-        self.table = QTableWidget(0, 3)
+        # 表格：类型 | 匹配值 | 描述 | 商品链接 | 资料摘要
+        self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ["类型", "匹配值", "资料全文 share_body"],
+            ["类型", "匹配值", "描述", "商品链接", "资料摘要"],
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -173,6 +192,8 @@ class CatalogPage(QWidget):
         h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(2, QHeaderView.Stretch)
+        h.setSectionResizeMode(3, QHeaderView.Stretch)
+        h.setSectionResizeMode(4, QHeaderView.Stretch)
         layout.addWidget(self.table, 1)
 
     # ---------- 事件 ----------
@@ -186,11 +207,19 @@ class CatalogPage(QWidget):
                 MATCH_TYPE_LABELS.get(it["match_type"], it["match_type"])
             ))
             self.table.setItem(r, 1, QTableWidgetItem(it["match_value"]))
+            desc = (it.get("description") or "").strip() or "—"
+            if len(desc) > 48:
+                desc = desc[:48] + "…"
+            self.table.setItem(r, 2, QTableWidgetItem(desc))
+            pu = (it.get("product_url") or "").strip() or "—"
+            if len(pu) > 56:
+                pu = pu[:56] + "…"
+            self.table.setItem(r, 3, QTableWidgetItem(pu))
             sb = (it.get("share_body") or "").strip()
             prev = sb.replace("\n", " ") if sb else "—"
             if len(prev) > 80:
                 prev = prev[:80] + "…"
-            self.table.setItem(r, 2, QTableWidgetItem(prev))
+            self.table.setItem(r, 4, QTableWidgetItem(prev))
             self.table.item(r, 0).setData(Qt.UserRole, it)
         self.lbl_count.setText(f"共 {len(items)} 条")
 
@@ -260,8 +289,9 @@ class CatalogPage(QWidget):
                 out.setPlainText("【未命中任何映射】")
             else:
                 out.setPlainText(
-                    f"首行摘要：{item.title}\n"
-                    f"share_url: {item.share_url}\n\n"
+                    f"描述：{item.description}\n"
+                    f"商品链接(product_url)：{item.product_url}\n"
+                    f"正文解析链接(share_url)：{item.share_url}\n\n"
                     f"--- 给客户的回复消息 ---\n"
                     f"{item.to_message()}"
                 )

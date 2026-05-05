@@ -2,13 +2,14 @@
 
 核心表（详见 md/architecture.md §5）：
     conv_state / order_state / card_code / action_log / settings / …
-    catalog_item（商品资料映射）、qa_item（店铺 QA 知识库）等。
+    catalog_item（商品资料映射：share_body + 可选 product_url/description）、qa_item（店铺 QA 知识库）等。
 
 所有方法都是同步阻塞，单进程使用够了。多线程访问时 sqlite 自带锁。
 """
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -17,6 +18,20 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from core import config
+
+_CATALOG_PAN_LINK_RE = re.compile(
+    r"https://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(?:\?[^\s]+)?",
+    re.IGNORECASE,
+)
+
+
+def _catalog_extract_pan_url(sb: str) -> str:
+    """从 share_body 中抽出第一条百度网盘链接（迁移回填用，与 tools.catalog 逻辑一致）。"""
+    t = (sb or "").strip()
+    if not t:
+        return ""
+    m = _CATALOG_PAN_LINK_RE.search(t)
+    return m.group(0).rstrip(".,;，。）)") if m else ""
 
 
 def _legacy_catalog_row_to_share_body(rd: dict[str, Any]) -> str:
@@ -136,6 +151,8 @@ CREATE TABLE IF NOT EXISTS catalog_item (
     match_type      TEXT NOT NULL,
     match_value     TEXT NOT NULL,
     share_body        TEXT NOT NULL DEFAULT '',
+    product_url       TEXT NOT NULL DEFAULT '',
+    description       TEXT NOT NULL DEFAULT '',
     updated_at      INTEGER,
     UNIQUE(match_type, match_value)
 );
@@ -178,6 +195,7 @@ class Store:
             self._conn.executescript(_DDL)
             self._conn.commit()
             self._migrate_catalog_legacy_columns()
+            self._migrate_catalog_product_columns()
 
     def _migrate_catalog_legacy_columns(self) -> None:
         """旧版 catalog_item 含 title/url/pwd/extra_text 时，合并为 share_body 后删表重建。"""
@@ -205,6 +223,8 @@ class Store:
                 match_type TEXT NOT NULL,
                 match_value TEXT NOT NULL,
                 share_body TEXT NOT NULL DEFAULT '',
+                product_url TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER,
                 UNIQUE(match_type, match_value)
             )
@@ -216,12 +236,50 @@ class Store:
         for mid, mt, mv, sb, ts in migrated:
             self._conn.execute(
                 """
-                INSERT INTO catalog_item(id, match_type, match_value, share_body, updated_at)
-                VALUES(?,?,?,?,?)
+                INSERT INTO catalog_item(
+                    id, match_type, match_value, share_body,
+                    product_url, description, updated_at
+                )
+                VALUES(?,?,?,?,?,?,?)
                 """,
-                (mid, mt, mv, sb, ts),
+                (mid, mt, mv, sb, "", "", ts),
             )
         self._conn.commit()
+
+    def _migrate_catalog_product_columns(self) -> None:
+        """为 catalog_item 增加 product_url / description，并对空的 product_url 从 share_body 解析回填。
+
+        description 列不自动从正文推断，避免与咨询阶段 LLM 仅用「人工描述」的策略冲突。
+        """
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(catalog_item)").fetchall()
+        }
+        if not cols:
+            return
+        with self._lock:
+            if "product_url" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE catalog_item ADD COLUMN product_url TEXT NOT NULL DEFAULT ''",
+                )
+            if "description" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE catalog_item ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+                )
+            self._conn.commit()
+        rows = self._query("SELECT id, share_body, product_url, description FROM catalog_item")
+        for r in rows:
+            rid = int(r["id"])
+            sb = r["share_body"] or ""
+            pu = (r["product_url"] or "").strip()
+            if pu:
+                continue
+            new_pu = _catalog_extract_pan_url(sb)
+            if new_pu:
+                self._exec(
+                    "UPDATE catalog_item SET product_url=? WHERE id=?",
+                    (new_pu, rid),
+                )
 
     # ---------- 通用 ----------
     def _exec(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
@@ -689,8 +747,16 @@ class Store:
         match_value: str,
         share_body: str,
         item_id: int | None = None,
+        *,
+        product_url: str = "",
+        description: str = "",
     ) -> int:
-        """新增或更新一条商品映射。仅保存发给客户的整段网盘话术 ``share_body``。返回行 id。"""
+        """新增或更新一条商品映射。
+
+        ``share_body`` 为发给客户的整段网盘话术（必填）。
+        ``product_url`` / ``description`` 可选，用于 LLM 与 GUI 展示；未填时运行时仍可从 ``share_body`` 解析。
+        返回行 id。
+        """
         if match_type not in ("goods_id", "sku_id", "keyword"):
             raise ValueError(f"match_type 必须是 goods_id/sku_id/keyword, 收到 {match_type!r}")
         if not match_value:
@@ -698,27 +764,34 @@ class Store:
         sb = (share_body or "").strip()
         if not sb:
             raise ValueError("share_body 不能为空")
+        pu = (product_url or "").strip()
+        desc = (description or "").strip()
 
         if item_id is not None:
             self._exec(
                 """
                 UPDATE catalog_item SET
-                    match_type=?, match_value=?, share_body=?, updated_at=?
+                    match_type=?, match_value=?, share_body=?,
+                    product_url=?, description=?, updated_at=?
                 WHERE id=?
                 """,
-                (match_type, match_value, sb, self.now(), item_id),
+                (match_type, match_value, sb, pu, desc, self.now(), item_id),
             )
             return item_id
 
         cur = self._exec(
             """
-            INSERT INTO catalog_item(match_type, match_value, share_body, updated_at)
-            VALUES(?, ?, ?, ?)
+            INSERT INTO catalog_item(
+                match_type, match_value, share_body, product_url, description, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?)
             ON CONFLICT(match_type, match_value) DO UPDATE SET
                 share_body=excluded.share_body,
+                product_url=excluded.product_url,
+                description=excluded.description,
                 updated_at=excluded.updated_at
             """,
-            (match_type, match_value, sb, self.now()),
+            (match_type, match_value, sb, pu, desc, self.now()),
         )
         return cur.lastrowid
 

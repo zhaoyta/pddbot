@@ -15,9 +15,9 @@
 |---|---|---|
 | D1 | 单 uid 多笔订单未核销 | 只处理**最新一笔**（按 `orderTime` 倒序取第一） |
 | D2 | 客户说"链接失效/打不开/没收到，再发一份" | **直接转人工**，不主动重发资料 |
-| D3 | 客户有售后单（`afterSalesInfo != null` 或 `compensateInfo.status` 有值） | **立即转人工 + 该 uid 静默 30 分钟** |
+| D3 | 客户有售后单（`afterSalesInfo != null` 或 `compensateInfo.status` 有值） | **立即转人工**（飞书告警）；`conv_state.silenced_until` 字段预留，**当前未写入静默截止时间** |
 | D4 | 首次接待该 uid（`conv_state` 无记录） | 先发一句"您好，请问有什么可以帮您？"，**等下一条消息才走 stage** |
-| D5 | 风控阈值 | 保持 `.env` 默认：全店 30/分钟、单 uid 3/分钟、夜间 23:00-08:00 静默 |
+| D5 | 风控阈值（分钟配额 / 夜间静默） | **尚未实现**：`.env` 中 `REPLY_DELAY_*`、`RATE_LIMIT_*` 仅入库为 `rate.*`，`bot.py` 未读取 |
 | D6 | 干跑模式 | 通过 `DRY_RUN=true` 切：LLM 正常生成回复但**不点发送**，只写 `action_log` 表，方便人工审核 |
 | D7 | 总开关 | `BOT_ENABLED=false` 时整个 bot 进入待机状态，只监听不动作（出问题秒关） |
 | D8 | 资料回复格式 | 严格按百度网盘原生分享格式（见 `tools/catalog.py` `to_message`） |
@@ -40,7 +40,7 @@
 | **S2** | 下单未核销引导 | 有"已支付订单"且**最新一笔**（D1）未发过教程图 | 发送"如何获取核销码"图片 + 文案 |
 | **S3** | 收到核销码 | 客户消息里**识别到合法核销码**且该码**未核销过** | 提取码 → 打开核销页 → 输入码 → 提交 |
 | **S4** | 核销完成发资料 | 该 uid 有**已核销但未发资料**的订单（取最新一笔） | 按 `goodsId` 查映射，按百度网盘格式回复 |
-| **S_HUMAN** | 转人工 | 触发 D2 / D3 / 工具连续失败等 | 发"已为您转接人工客服" + 静默 30 分钟 |
+| **S_HUMAN** | 转人工 | 触发 D2 / D3 等规则 | **不经 LLM**：飞书告警 + `action_log`；不向买家自动发固定话术；未调用 `silence_uid` |
 
 > 同一条新消息进入时，**按 S_HUMAN → S0 → S3 → S4 → S2 → S1 优先级判定**：
 > - 先看是否触发"必须转人工"硬规则（售后/退款/明确求重发）
@@ -165,10 +165,11 @@ pddbot/
 
 | 项 | 内容 |
 |---|---|
-| 触发 | D2（索要重发）/ D3（售后）/ 工具连续 2 次失败 |
-| 可用 tools | `escalate_to_human` |
-| 目标 | 发"非常抱歉，已为您转接人工客服，请稍候"，并对该 uid 静默 30 分钟 |
-| 副作用 | `store.silence_uid(uid, 1800)` |
+| 触发 | `core/stage.decide` 返回 `S_HUMAN`（敏感词 / 售后单等） |
+| 实际行为 | **`bot.py` 直接处理**：`notify.send_feishu`（转人工告警）+ `action_log`；**不调用** `llm_runner`，会话侧无固定「已转人工」文案（与早期设计稿不同） |
+| DB | `silenced_until` 列存在，当前 upsert 仍为 `0`；`store.silence_uid` **未被主流程调用** |
+
+> 提示：模型在其它 Stage 内也可主动调用工具 `escalate_to_human`，该路径走 LLM tools，与规则触发的 `S_HUMAN` 分支不同。
 
 ### 3.2 Stage S1（咨询）
 
@@ -249,7 +250,7 @@ def lookup_product_url(goods_name: str | None = None,
 
 # tools/notify.py
 def escalate_to_human(uid: str, reason: str) -> dict:
-    """触发告警（控制台 / 邮件 / 微信机器人 / 钉钉），并在该会话静默 N 分钟。"""
+    """触发飞书 webhook 告警（可选）；不写 silenced_until。"""
 ```
 
 ---
@@ -262,7 +263,7 @@ CREATE TABLE conv_state (
     uid             TEXT PRIMARY KEY,
     last_msg_id     TEXT,          -- 已处理过的最大 msg_id
     last_active_ts  INTEGER,
-    silenced_until  INTEGER,       -- 转人工后的静默截止
+    silenced_until  INTEGER,       -- 预留：转人工后静默截止（当前主流程未写入）
     notes           TEXT
 );
 
@@ -314,9 +315,14 @@ CREATE TABLE action_log (
 |---|---|
 | `match_type` | `goods_id` / `sku_id` / `keyword` |
 | `match_value` | 商品 ID / SKU ID 数字串;关键字模式时用英文逗号分隔多个词,如 `"散打,S022"` |
-| `title` / `url` / `pwd` / `extra_text` | 资料元信息 |
+| `share_body` | 发给客户的整段百度网盘话术（必填） |
+| `product_url` | 可选，对外展示的资料链接；未填时运行时可从正文解析 |
+| `description` | 可选，简短描述；未填时可用正文首行摘要 |
 
 `tools.catalog.lookup()` 查询优先级:`goods_id > sku_id > keyword(最长命中)`。
+命中后 `CatalogItem.product_url` / `description` 为显式字段与解析结果的合并（显式优先）。
+
+**Agent 模式**：每次组装 LLM 用户消息时，`llm/runner.py` 会追加 `【店铺商品资料索引】`，列出 **全部** `catalog_item` 条目的类型、匹配值、链接与后台「描述」（不包含 `share_body` 全文），便于无订单时也能回答「有没有某类资料」；核销后发复制话术仍走 `lookup_product_url` 等工具。
 
 ---
 
@@ -363,16 +369,19 @@ GUI 首页提供两种启动模式(下拉选择,默认根据 `storage_state.json
 
 ---
 
-## 8. 风控与节流
+## 8. 风控与节流（与实现对齐）
 
-| 维度 | 限制 |
+| 维度 | 当前实现 |
 |---|---|
-| 单条消息延迟 | 收到新消息后随机 sleep 1.5~3.5 秒再回复 |
-| 单 uid 频次 | 每 uid 最多每分钟回 3 条 |
-| 全店频次 | 全店每分钟最多 30 条自动回复 |
-| 夜间静默 | 23:00~08:00 默认不回复（可配置） |
-| 错误转人工 | 同一 uid 连续 2 次工具调用失败 → escalate_to_human + 静默 30 分钟 |
-| 黑名单关键词 | 客户消息含"投诉/曝光/12315/差评/官方介入" → 立刻转人工 |
+| 回复前整段等待 | **未实现**：`rate.reply_delay_min/max` 未在 `bot.py` 使用 |
+| 单 uid / 全店每分钟条数 | **未实现**：`rate.per_uid_per_min`、`rate.global_per_min` 未统计与拦截 |
+| 夜间时段不回复 | **未实现** |
+| 输入框节奏 | `tools/messaging.py` 等对按键/输入有随机间隔（≠ 整句回复前延迟） |
+| 浏览器启动温身 | `browser.warmup_delay_*` + GUI「风控」页，经 `BrowserSession` 生效 |
+| 规则转人工 | `core/stage.py` 敏感词、售后等 → `S_HUMAN` → 飞书 + 日志（见 §3.1.6） |
+| 模型侧转人工 | 各 Stage 工具 `escalate_to_human` → 飞书 + `action_log` |
+
+以下为**设计预留 / 未落地**：「连续 2 次工具失败自动 escalate」「转人工后静默 30 分钟」等需在 `bot.py` / `store` 层补充逻辑后方可宣称支持。
 
 ---
 
@@ -393,6 +402,8 @@ GUI 首页提供两种启动模式(下拉选择,默认根据 `storage_state.json
 ┌──────────────────────────────────────────────────────┐
 │ llm/runner.py                                        │
 │   run_stage(stage, context, deps) -> reply_text      │
+│   · 组装 HumanMessage：店铺 QA +【店铺商品资料索引】+ 订单摘要 + …
+│      （索引为全店映射的链接/描述，不含 share_body 全文）           │
 │      ↓                                               │
 │   llm/agent.py: build_agent(stage, deps)             │
 │      ↓ create_agent(model, tools=stage_tools, prompt)│
@@ -434,10 +445,9 @@ deps 必填字段:`store`, `uid`, `stage`, `browser`(可空), `dry_run`(bool)。
 
 ### 9.3 当前实现状态
 
-- ✅ `llm/client.py` `prompts.py` `tools.py` `agent.py` `runner.py` 全部就绪
-- ✅ 离线 smoke test 通过(`python -m llm._smoke_test`)
-- ⏳ tools 中的 `send_text` / `send_card_code_guide` / `submit_card_code` 当前是 **stub**,
-     等 `runtime/browser.py` 接入后替换为真实 Playwright 操作(签名保持不变)。
+- ✅ `llm/client.py` `prompts.py` `tools.py` `agent.py` `runner.py` 与 Playwright 工具实现已接通（非 stub）。
+- ✅ 离线 smoke：`python -m llm._smoke_test`
+- ⏳ 分钟级节流、夜间静默、`silence_uid` 接入主循环等待实现（配置键已预留）。
 
 ---
 
@@ -452,13 +462,13 @@ deps 必填字段:`store`, `uid`, `stage`, `browser`(可空), `dry_run`(bool)。
 | 4 | `core/store.py`：SQLite 状态库（含 settings / stage_config / catalog_item） | ✅ |
 | 5 | `llm/`：DeepSeek + LangGraph create_agent（5 个 stage） | ✅ |
 | 5b | GUI:首页/日志/商品/模型/阶段/飞书 | ✅ |
-| 6 | `core/stage.py`：状态机（D1~D7 决策） | 待做 |
+| 6 | `core/stage.py`：状态机（D1~D7 决策） | ✅ |
 | 7 | `tools/notify.py`：飞书 webhook 通知 | ✅ |
-| 8 | `runtime/browser.py` `network.py` `selectors.py` | ⏳ 等 selector |
-| 9 | `tools/messaging.py`：替换 llm/tools.py 里的 stub | ⏳ 等 selector |
-| 10 | `tools/orders.py`：被动监听 + 主动重放 userAllOrder | 待做 |
-| 11 | `tools/redeem.py`：核销页自动化 | ⏳ 等核销页探查 |
-| 12 | `bot.py`：装配 + 主循环 + 节流 + 对话锁 | 待做 |
+| 8 | `runtime/browser.py` `network.py`（及页面交互） | ✅（选择器随拼多多改版需维护） |
+| 9 | `tools/messaging.py`：DOM 发送 | ✅ |
+| 10 | 订单上下文：HTTP 拦截 + `orders_fetch` | ✅ |
+| 11 | `tools/redeem.py`：核销页自动化 | ✅（选择器需维护） |
+| 12 | `bot.py`：主循环装配 | ✅（分钟节流 / 夜间静默 / 显式对话锁仍待加） |
 | 13 | 健康检查：每小时跑 selector 探针 | 待做 |
 | 14 | 每日报表：23:00 汇总 action_log | 待做 |
 | 15 | 先 DRY_RUN 跑 1~2 天审核质量 | 待做 |

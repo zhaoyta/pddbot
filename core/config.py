@@ -68,6 +68,8 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
 # ----- 行为参数 -----
+# 下列常量仅为读 .env 的便捷副本；业务路径使用 settings 表的 rate.*。
+# 当前 bot 主循环未读取延时与配额（参见 md/architecture.md §8）。
 REPLY_DELAY_MIN = float(os.getenv("REPLY_DELAY_MIN", "1.5"))
 REPLY_DELAY_MAX = float(os.getenv("REPLY_DELAY_MAX", "3.5"))
 RATE_LIMIT_PER_UID_PER_MIN = int(os.getenv("RATE_LIMIT_PER_UID_PER_MIN", "3"))

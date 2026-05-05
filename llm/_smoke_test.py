@@ -81,6 +81,7 @@ def test_lookup_tool_real_data() -> None:
     assert "百度网盘" in out["message"]
     assert "S022-散打" in out["message"]
     assert "?pwd=fdby" in out["message"]
+    assert out["product_url"] == out["url"]
     print("[OK] lookup_product_url 输出:")
     print("---")
     print(out["message"])
@@ -109,7 +110,64 @@ def test_lookup_share_body_full_message() -> None:
     assert out is not None
     assert out["message"] == body
     assert out["url"] == "https://pan.baidu.com/s/1wy8HeiURHdEHHMeCO3vM2A?pwd=6893"
+    assert out["product_url"] == out["url"]
+    assert "生活小妙招" in out["description"]
     print("[OK] lookup_product_url 整段文案模式")
+
+
+def test_lookup_explicit_product_url_priority() -> None:
+    """显式 product_url 优先于正文解析。"""
+    store = Store(TMP_DB)
+    body = (
+        "通过百度网盘分享的文件：备份课\n"
+        "链接：https://pan.baidu.com/s/1backupXXXX\n"
+        "复制这段内容打开「百度网盘APP 即可获取」"
+    )
+    store.upsert_catalog_item(
+        match_type="goods_id",
+        match_value="1122334455",
+        share_body=body,
+        product_url="https://example.com/custom-material",
+        description="自定义描述一行",
+    )
+    deps = {"store": store, "page": None, "uid": "TEST_UID",
+            "stage": "S4_DELIVER", "dry_run": False}
+    ts = make_stage_tools("S4_DELIVER", deps)
+    lookup = next(t for t in ts if t.name == "lookup_product_url")
+    out = lookup.invoke({"goods_id": "1122334455"})
+    assert out is not None
+    assert out["product_url"] == "https://example.com/custom-material"
+    assert out["url"] == "https://example.com/custom-material"
+    assert out["description"] == "自定义描述一行"
+    print("[OK] lookup_product_url 显式链接与描述优先")
+
+
+def test_build_user_message_includes_catalog_block() -> None:
+    """runner 注入全店【店铺商品资料索引】（非仅当前订单）。"""
+    from llm.runner import _build_user_message
+
+    store = Store(TMP_DB)
+    msg = (
+        "通过百度网盘分享的文件：S099-测试课\n"
+        "链接：https://pan.baidu.com/s/1TestInjectOnly?pwd=abcd\n"
+        "复制这段内容打开「百度网盘APP 即可获取」"
+    )
+    store.upsert_catalog_item(
+        match_type="keyword",
+        match_value="瑜伽,入门",
+        share_body=msg,
+        description="瑜伽入门视频资料",
+    )
+    # 无订单也应出现索引
+    ctx = {"latest_message": "有没有瑜伽方面的资料"}
+    packed = _build_user_message("S1_CONSULT", ctx)
+    assert "【店铺商品资料索引】" in packed
+    assert "keyword=瑜伽,入门" in packed
+    assert "瑜伽入门视频资料" in packed
+    assert "pan.baidu.com" in packed
+    assert "复制这段内容打开" not in packed
+    assert "通过百度网盘分享的文件" not in packed
+    print("[OK] _build_user_message 含全店商品资料索引（无 share_body 全文）")
 
 
 def test_send_text_writes_action_log() -> None:
@@ -163,6 +221,10 @@ def main() -> None:
     test_lookup_tool_real_data()
     print("\n=== 3b. lookup 整段文案 ===")
     test_lookup_share_body_full_message()
+    print("\n=== 3c. lookup 显式链接 ===")
+    test_lookup_explicit_product_url_priority()
+    print("\n=== 3d. runner 注入映射 ===")
+    test_build_user_message_includes_catalog_block()
     print("\n=== 4. send_text 落 action_log ===")
     test_send_text_writes_action_log()
     print("\n=== 5. 各 stage agent 编译 ===")

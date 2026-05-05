@@ -28,6 +28,7 @@ GUI 写到 settings 表里的值运行时即时生效（无需重启）。
     rate.reply_delay_max   "3.5"
     rate.per_uid_per_min   "3"
     rate.global_per_min    "30"
+    （rate.*：可由 .env 写入 settings；当前 bot 主循环未读取，分钟配额/夜间静默等待实现。）
 
     app.chat_url           ""  (空则 config.CHAT_URL)
     app.login_url          ""  (空则 config.LOGIN_URL)

@@ -5,7 +5,9 @@
     - User-Agent / viewport / slow_mo
     - user_data_dir(持久化 profile)
     - 代理 / 时区 / locale
-    - 节流参数(per-uid/global)
+    - 启动温身延迟(browser.warmup_delay_*)
+
+（按分钟回复配额、夜间静默等若落地，可另页或与本页扩展；当前不在此页。）
 
 存储:全部走 settings 表(GUI 改完即时生效,下次启动 bot 加载)。
 """

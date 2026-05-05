@@ -8,6 +8,15 @@
 |---|---|---|
 | `card_code_guide.png` | S2 阶段发给"已下单未核销"客户的"如何获取核销码"教程图 | **请你拷贝过来** |
 
+## 文档用可选资源（`@assets/`）
+
+对外说明见 [`community.md`](community.md)。
+
+| 文件 | 用途 |
+|---|---|
+| `@assets/gerenerweima.JPG` | 微信加好友二维码（加群前先添加，备注 **PDDBOT**） |
+| `@assets/dashang.JPG` | 微信支付自愿打赏二维码 |
+
 ## 命名约定
 
 - 图片：`{stage}_{purpose}.png`，比如 `s2_card_code_guide.png`、`s4_redeem_success.png`

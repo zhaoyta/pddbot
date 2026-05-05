@@ -16,6 +16,7 @@
     内部由工具回写（勿在业务里手动设）:
     _chat_sent_via_tool : 若 send_text / send_card_code_guide 已成功向会话发过 DOM 消息,
                           bot 将不再把模型尾部的 reply_text 再发一遍,避免重复。
+    _send_text_parts     : send_text 多次调用时先追加到此列表,由 bot 在 LLM 回合结束后合并为一条发出。
 """
 from __future__ import annotations
 
@@ -86,38 +87,33 @@ def _make_send_text(deps: dict):
     async def send_text(text: str) -> str:
         """主动发送一段文字给【当前会话客户】。
 
+        可在一轮对话中多次调用；正文会在该轮 LLM 结束后由 bot **合并为一条消息**发出，
+        避免会话里出现多条气泡。建议仍将完整答复（含链接）写在一次调用里。
+
         参数:
             text: 要发送的文本（≤ 2000 字）
         返回:
             "ok" 或错误描述
         """
         uid = deps.get("uid", "")
-        if _dom_stub(deps):
-            logger.debug("[send_text] stub uid={} len(text)={}", uid, len(text or ""))
-            _log_action(deps, "send_text", {"text": text}, True)
-            return "ok"
-
-        from tools import messaging as msg_mod
-
-        page = deps.get("page")
-        ok, err = await msg_mod.send_chat_message(page, text)
-        _log_action(
-            deps, "send_text", {"text": text}, ok, err,
+        chunk = (text or "").strip()
+        if not chunk:
+            return "empty_text"
+        parts = deps.setdefault("_send_text_parts", [])
+        parts.append(chunk)
+        logger.debug(
+            "[send_text] 已加入待发队列 uid={} part_len={} total_parts={}",
+            uid,
+            len(chunk),
+            len(parts),
         )
-        if ok:
-            _note_chat_sent_via_tool(deps)
-            store = deps.get("store")
-            if (
-                deps.get("stage") == "S4_DELIVER"
-                and (deps.get("order_sn") or "").strip()
-                and store
-                and ("http" in (text or "") or "pan.baidu.com" in (text or ""))
-            ):
-                try:
-                    store.mark_order_delivered(str(deps["order_sn"]).strip())
-                except Exception as e:
-                    logger.warning("[send_text] mark_order_delivered 失败: {}", e)
-        return "ok" if ok else (err or "send_failed")
+        _log_action(
+            deps,
+            "send_text",
+            {"text": chunk, "queued": True, "part_index": len(parts)},
+            True,
+        )
+        return "ok"
 
     return send_text
 
@@ -218,8 +214,8 @@ def _make_lookup_product_url(deps: dict):
             sku_id: 拼多多 skuId（次选）
             goods_name: 商品名（兜底,模糊匹配）
         返回:
-            命中: {title, url, pwd, message}；title 为正文首行摘要，url/pwd 从正文链接解析；
-            message 为发给客户的整段 share_body。
+            命中: ``CatalogItem.to_dict()`` — {{title, url, product_url, description, pwd, message}}；
+            message 为发给客户的整段 share_body；url/product_url 为对外链接（显式配置优先）。
             未命中: None
         """
         item = catalog_mod.lookup(
@@ -232,12 +228,7 @@ def _make_lookup_product_url(deps: dict):
                 False, "miss",
             )
             return None
-        result = {
-            "title": item.title,
-            "url": item.share_url,
-            "pwd": item.pwd,
-            "message": item.to_message(),
-        }
+        result = item.to_dict()
         _log_action(
             deps, "lookup_product_url",
             {"in": {"goods_id": goods_id, "sku_id": sku_id, "goods_name": goods_name},
