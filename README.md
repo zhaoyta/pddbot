@@ -41,7 +41,7 @@
 ### 使用指导（GUI）
 
 <p align="center">
-  <img src="./assets/@assets/guide.gif" alt="pddbot：首页选择登录方式并点击「启动机器人」" width="920" />
+  <img src="./assets/@assets/guide.gif" alt="pddbot：首页选择登录方式并点击「启动机器人」" width="500" />
 </p>
 
 ### 环境变量
